@@ -1,0 +1,4 @@
+.vene/
+--pycache--/
+.env
+*.pyc
