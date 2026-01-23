@@ -1,213 +1,219 @@
 import os
+import re
 import json
-from typing import Any, Dict
+import asyncio
+from typing import Dict, List, Optional
 
-from fastapi import FastAPI, Request, Response
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ConversationHandler,
     ContextTypes,
     filters,
 )
 
-# =========================
-# Config
-# =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "Jozef3333")  # اختياري للحماية
-BASE_URL = os.getenv("BASE_URL", "https://web-production-ec68.up.railway.app").strip()  # مثل: https://xxxx.up.railway.app
-
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN env var")
 
 # =========================
-# Conversation States
+# In-memory buffers per user/chat
 # =========================
-(
-    SHOP,
-    CUSTOMER,
-    PHONE,
-    DISTRICT,
-    ADDRESS,
-    AMOUNT,
-    NOTES,
-) = range(7)
+BUFFERS: Dict[int, List[str]] = {}
+TIMERS: Dict[int, asyncio.Task] = {}
 
-AR = {
-    "welcome": "✅ أهلاً بك!\nسأجهّز الشحنة خطوة بخطوة.\n\nابدأ بكتابة *اسم المتجر*:",
-    "cancel": "تم الإلغاء ✅\nإذا تريد تبدأ من جديد اكتب /start",
-    "ask_customer": "تمام.\nاكتب *اسم الزبون*:",
-    "ask_phone": "اكتب *رقم هاتف الزبون* (يفضل يبدأ 07 وطوله 11 رقم):",
-    "bad_phone": "⚠️ الرقم غير صحيح.\nاكتب رقم مثل: 07701234567",
-    "ask_district": "اكتب *المنطقة/الحي*:",
-    "ask_address": "اكتب *العنوان الكامل*:",
-    "ask_amount": "اكتب *مبلغ الاستلام (IQD)* رقم فقط مثال: 25000",
-    "bad_amount": "⚠️ المبلغ لازم يكون رقم فقط.\nمثال: 25000",
-    "ask_notes": "اكتب *ملاحظات* (أو اكتب - إذا ماكو):",
-    "done": "✅ تم تجهيز الشحنة (JSON جاهز):",
-    "hint": "إذا تريد تبدأ شحنة جديدة: /new\nإذا تريد إلغاء: /cancel",
-}
+AUTO_PROCESS_SECONDS = int(os.getenv("AUTO_PROCESS_SECONDS", "0"))  # 0 = off
 
-def _clean_text(t: str) -> str:
-    return (t or "").strip()
 
-def _is_valid_phone(phone: str) -> bool:
+# =========================
+# Helpers: parsing
+# =========================
+PHONE_RE = re.compile(r"(\+964\s?7\d{9}|07\d{9})")
+AMOUNT_RE = re.compile(r"(?:مبلغ|المبلغ|amount)\s*[:：]?\s*(\d{3,})", re.IGNORECASE)
+
+def normalize_phone(phone: str) -> str:
     phone = phone.replace(" ", "")
-    return phone.isdigit() and len(phone) == 11 and phone.startswith("07")
+    if phone.startswith("+9647"):
+        return "0" + phone[4:]  # +9647XXXXXXXXX -> 07XXXXXXXXX
+    return phone
 
-def _pretty_json(payload: Dict[str, Any]) -> str:
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+def split_into_orders(text: str) -> List[str]:
+    """
+    تقسيم النص إلى طلبات.
+    القاعدة: كل طلب لازم يحتوي رقم هاتف (07... أو +9647...).
+    نقسم حسب ظهور أرقام الهواتف.
+    """
+    matches = list(PHONE_RE.finditer(text))
+    if not matches:
+        return [text.strip()] if text.strip() else []
 
-def _build_payload(data: Dict[str, Any]) -> Dict[str, Any]:
-    # هنا نجهز الPayload النهائي (تقدر تغيّر المفاتيح حسب API لاحقًا)
+    chunks = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+def extract_order_fields(order_text: str) -> Dict:
+    """
+    استخراج حقول عامة من النص.
+    نعتبر أول رقم هاتف هو الأساس.
+    """
+    phone_match = PHONE_RE.search(order_text)
+    phone = normalize_phone(phone_match.group(1)) if phone_match else ""
+
+    amount_match = AMOUNT_RE.search(order_text)
+    amount = int(amount_match.group(1)) if amount_match else None
+
+    # اسم الزبون: نحاول التقاطه من "اسم:" أو "الاسم:"
+    name = ""
+    m = re.search(r"(?:اسم|الاسم)\s*[:：]\s*(.+)", order_text)
+    if m:
+        name = m.group(1).strip().splitlines()[0]
+
+    # العنوان
+    address = ""
+    m = re.search(r"(?:عنوان|العنوان)\s*[:：]\s*(.+)", order_text)
+    if m:
+        address = m.group(1).strip()
+
+    # ملاحظات
+    notes = ""
+    m = re.search(r"(?:ملاحظات|ملاحظة)\s*[:：]\s*(.+)", order_text)
+    if m:
+        notes = m.group(1).strip()
+
+    # المحافظة/المنطقة (اختياري)
+    city = ""
+    m = re.search(r"(?:محافظة|المدينة)\s*[:：]\s*(.+)", order_text)
+    if m:
+        city = m.group(1).strip().splitlines()[0]
+
+    district = ""
+    m = re.search(r"(?:منطقة|المنطقه|قضاء)\s*[:：]\s*(.+)", order_text)
+    if m:
+        district = m.group(1).strip().splitlines()[0]
+
     return {
-        "shopName": data["shop_name"],
-        "customerName": data["customer_name"],
-        "phone": data["phone"],
-        "district": data["district"],
-        "address": data["address"],
-        "amountIQD": data["amount_iqd"],
-        "notes": data.get("notes", ""),
+        "customerName": name or "غير محدد",
+        "phone": phone or "غير محدد",
+        "amountIQD": amount if amount is not None else 0,
+        "city": city,
+        "district": district,
+        "address": address,
+        "notes": notes if notes else order_text.strip(),  # نخلي النص كله ملاحظة إذا ماكو حقل واضح
+        "raw": order_text.strip(),
     }
 
+def parse_orders(full_text: str) -> List[Dict]:
+    orders_text = split_into_orders(full_text)
+    orders = [extract_order_fields(x) for x in orders_text if x.strip()]
+    # فلترة الطلبات الفارغة
+    return [o for o in orders if o.get("raw")]
+
+
 # =========================
-# Telegram Handlers
+# Bot commands
 # =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text(AR["welcome"], parse_mode=ParseMode.MARKDOWN)
-    return SHOP
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ وضع التجميع شغال.\n"
+        "ارسل كل رسائل الزبائن (رسالة واحدة أو عدة رسائل).\n\n"
+        "لما تخلص اكتب: /done\n"
+        "للحذف: /cancel"
+    )
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text(AR["cancel"])
-    return ConversationHandler.END
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    BUFFERS.pop(chat_id, None)
+    t = TIMERS.pop(chat_id, None)
+    if t:
+        t.cancel()
+    await update.message.reply_text("🗑️ تم حذف التجميع الحالي. ارسل من جديد ثم /done.")
 
-async def new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text("✅ ممتاز. اكتب *اسم المتجر*:", parse_mode=ParseMode.MARKDOWN)
-    return SHOP
+async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = "\n".join(BUFFERS.get(chat_id, [])).strip()
+    BUFFERS.pop(chat_id, None)
 
-async def shop_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["shop_name"] = _clean_text(update.message.text)
-    await update.message.reply_text(AR["ask_customer"], parse_mode=ParseMode.MARKDOWN)
-    return CUSTOMER
+    t = TIMERS.pop(chat_id, None)
+    if t:
+        t.cancel()
 
-async def customer_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["customer_name"] = _clean_text(update.message.text)
-    await update.message.reply_text(AR["ask_phone"], parse_mode=ParseMode.MARKDOWN)
-    return PHONE
+    if not text:
+        await update.message.reply_text("ما استلمت نص بعد. ارسل رسائل ثم /done.")
+        return
 
-async def phone_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    phone = _clean_text(update.message.text)
-    if not _is_valid_phone(phone):
-        await update.message.reply_text(AR["bad_phone"])
-        return PHONE
-    context.user_data["phone"] = phone
-    await update.message.reply_text(AR["ask_district"], parse_mode=ParseMode.MARKDOWN)
-    return DISTRICT
-
-async def district_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["district"] = _clean_text(update.message.text)
-    await update.message.reply_text(AR["ask_address"], parse_mode=ParseMode.MARKDOWN)
-    return ADDRESS
-
-async def address_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["address"] = _clean_text(update.message.text)
-    await update.message.reply_text(AR["ask_amount"], parse_mode=ParseMode.MARKDOWN)
-    return AMOUNT
-
-async def amount_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = _clean_text(update.message.text).replace(",", "")
-    if not raw.isdigit():
-        await update.message.reply_text(AR["bad_amount"])
-        return AMOUNT
-    context.user_data["amount_iqd"] = int(raw)
-    await update.message.reply_text(AR["ask_notes"], parse_mode=ParseMode.MARKDOWN)
-    return NOTES
-
-async def notes_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    notes = _clean_text(update.message.text)
-    if notes == "-":
-        notes = ""
-    context.user_data["notes"] = notes
-
-    payload = _build_payload(context.user_data)
-    pretty = _pretty_json(payload)
+    orders = parse_orders(text)
+    pretty = json.dumps(orders, ensure_ascii=False, indent=2)
 
     await update.message.reply_text(
-        f"{AR['done']}\n\n```json\n{pretty}\n```\n\n{AR['hint']}",
-        parse_mode=ParseMode.MARKDOWN,
+        f"✅ تم تحليل الرسائل.\n"
+        f"عدد الطلبات المستخرجة: {len(orders)}\n\n"
+        f"```json\n{pretty}\n```",
+        parse_mode="Markdown"
     )
-    return ConversationHandler.END
 
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("اكتب /start للبدء ✅")
+    # هنا لاحقًا: نربط إنشاء الشحنات عبر API
+    # for order in orders:
+    #     result = await create_shipment_via_api(order)
+    # ثم نرجع رقم الشحنة/الباركود للتاجر
 
-def build_application() -> Application:
+
+async def _auto_finalize(chat_id: int, app: Application):
+    await asyncio.sleep(AUTO_PROCESS_SECONDS)
+    text = "\n".join(BUFFERS.get(chat_id, [])).strip()
+    if not text:
+        return
+
+    orders = parse_orders(text)
+    pretty = json.dumps(orders, ensure_ascii=False, indent=2)
+
+    BUFFERS.pop(chat_id, None)
+    TIMERS.pop(chat_id, None)
+
+    await app.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"⏱️ تم المعالجة تلقائيًا بسبب عدم وجود رسائل جديدة.\n"
+            f"عدد الطلبات: {len(orders)}\n\n"
+            f"```json\n{pretty}\n```"
+        ),
+        parse_mode="Markdown"
+    )
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    msg = (update.message.text or "").strip()
+    if not msg:
+        return
+
+    BUFFERS.setdefault(chat_id, []).append(msg)
+
+    # خيار المعالجة التلقائية بعد فترة سكون
+    if AUTO_PROCESS_SECONDS > 0:
+        old = TIMERS.get(chat_id)
+        if old:
+            old.cancel()
+        TIMERS[chat_id] = asyncio.create_task(_auto_finalize(chat_id, context.application))
+
+    await update.message.reply_text("📥 تم استلام الرسالة. أكمل إرسال البقية ثم /done")
+
+
+def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            SHOP: [MessageHandler(filters.TEXT & ~filters.COMMAND, shop_step)],
-            CUSTOMER: [MessageHandler(filters.TEXT & ~filters.COMMAND, customer_step)],
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_step)],
-            DISTRICT: [MessageHandler(filters.TEXT & ~filters.COMMAND, district_step)],
-            ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, address_step)],
-            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, amount_step)],
-            NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, notes_step)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("done", done))
+    app.add_handler(CommandHandler("cancel", cancel))
 
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("new", new))
-    app.add_handler(MessageHandler(filters.COMMAND, unknown))
-    return app
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-# =========================
-# FastAPI (Webhook)
-# =========================
-tg_app: Application = build_application()
-api = FastAPI()
+    app.run_polling()
 
-@api.on_event("startup")
-async def on_startup():
-    await tg_app.initialize()
-    await tg_app.start()
 
-    # إذا BASE_URL موجود: نفعّل Webhook
-    if BASE_URL:
-        webhook_url = f"{BASE_URL}/webhook/{WEBHOOK_SECRET}"
-        await tg_app.bot.set_webhook(webhook_url)
-        print("✅ Webhook set:", webhook_url)
-    else:
-        print("⚠️ BASE_URL not set. Webhook not configured.")
-
-@api.on_event("shutdown")
-async def on_shutdown():
-    await tg_app.stop()
-    await tg_app.shutdown()
-
-@api.get("/")
-async def root():
-    return {"status": "ok", "bot": "running"}
-
-@api.post("/webhook/{secret}")
-async def webhook(secret: str, request: Request) -> Response:
-    if secret != WEBHOOK_SECRET:
-        return Response(status_code=403, content="forbidden")
-
-    data = await request.json()
-    update = Update.de_json(data, tg_app.bot)
-    await tg_app.process_update(update)
-    return Response(status_code=200, content="ok")
-
-# Railway expects "app"
-app = api
+if __name__ == "__main__":
+    main()
